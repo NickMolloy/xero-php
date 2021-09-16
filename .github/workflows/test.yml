@@ -1,0 +1,61 @@
+name: Test and Lint
+on:
+  push:
+  pull_request:
+    branches:
+      - master
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php:
+          - 5.6
+          - 7.0
+          - 7.1
+          - 7.2
+          - 7.3
+          - 7.4
+    name: Run PHPUnit tests on PHP ${{ matrix.php }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+
+    - name: Install PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ matrix.php }}
+        extensions: json simplexml
+
+    - name: Get composer cache directory
+      id: composer-cache
+      run: echo "::set-output name=dir::$(composer config cache-files-dir)"
+
+    - name: Cache dependencies
+      uses: actions/cache@v2
+      with:
+        path: ${{ steps.composer-cache.outputs.dir }}
+        key: composer-${{ hashFiles('**/composer.json') }}
+        restore-keys: composer-
+
+    - name: Install dependencies
+      run: composer install
+
+    - name: PHPUnit Tests
+      run: vendor/bin/phpunit
+
+  lint:
+    runs-on: ubuntu-latest
+    name: Run lint tools
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Install PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: 7.4
+          tools: phpstan
+
+      - name: Run PHPStan
+        run: phpstan analyse src
