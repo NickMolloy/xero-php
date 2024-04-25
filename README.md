@@ -54,6 +54,12 @@ $provider = new \Calcinai\OAuth2\Client\Provider\Xero([
 if (!isset($_GET['code'])) {
 
     // If we don't have an authorization code then get one
+    // Additional scopes may be required depending on your application
+    // additional common scopes are:
+    // Add/edit contacts: accounting.contacts
+    // Add/edit attachments accounting.attachments
+    // Refresh tokens for non-interactive re-authorisation: offline_access
+    // See all Xero Scopes https://developer.xero.com/documentation/guides/oauth2/scopes/
     $authUrl = $provider->getAuthorizationUrl([
         'scope' => 'openid email profile accounting.transactions'
     ]);
@@ -100,13 +106,24 @@ $authUrl = $provider->getAuthorizationUrl([
  ```
  
 ### Refreshing a token
-
 ```php
+// Requires scope offline_access
 $newAccessToken = $provider->getAccessToken('refresh_token', [
     'refresh_token' => $existingAccessToken->getRefreshToken()
 ]);
 ```
 
+### Client credentials flow (custom connections)
+You can utilise the client credentials grant type by creating a ["Custom Connection"](https://developer.xero.com/documentation/guides/oauth2/custom-connections/). Once you have your client credentials, usage is the same as The League's OAuth client. You can select your scopes when configuring your Custom Connection.
+
+```php
+$provider = new \Calcinai\OAuth2\Client\Provider\Xero([
+    'clientId'          => '{xero-client-id}',
+    'clientSecret'      => '{xero-client-secret}',
+]);
+$token = $provider->getAccessToken('client_credentials');
+$tenants = $provider->getTenants($token);
+```
 
 ## Interacting with the API
 
@@ -174,6 +191,7 @@ $contact->setName('Test Contact')
 
 ### Saving resources
 ```php
+// Requires scope accounting.contacts to add/edit contacts
 $contact->save();
 ```
 
@@ -200,6 +218,7 @@ foreach ($attachment as $attachment) {
 }
 
 //You can also upload attachemnts
+// Requires scope accounting.attachments
 $attachment = Attachment::createFromLocalFile('/path/to/image.jpg');
 $invoice->addAttachment($attachment);
 ```
@@ -213,6 +232,21 @@ Models that support PDF export will inherit a ```->getPDF()``` method, which ret
 The [unit price decimal place precision](https://developer.xero.com/documentation/api-guides/rounding-in-xero) (the `unitdp` parameter) is set via a config option:
 ```php
 $xero->setConfigOption('xero', 'unitdp', 3);
+```
+
+## Practice Manager
+
+If requiring the "practicemanager" scope please query models using the following syntax
+
+```php
+$clients = $xero->load(\XeroPHP\Models\PracticeManager\Client::class)
+            ->setParameter('detailed', true)
+            ->setParameter('modifiedsince', date('Y-m-d\TH:i:s', strtotime('- 1 week')))
+            ->execute();
+
+foreach ($clients as $client) {
+    $name = $client->getName();
+}
 ```
 
 ## Webhooks
@@ -259,12 +293,119 @@ See: [Signature documentation](https://developer.xero.com/documentation/webhooks
 Your request to Xero may cause an error which you will want to handle. You might run into errors such as:
 
 - `HTTP 400 Bad Request` by sending invalid data, like a malformed email address.
+- `HTTP 429 Too Many Requests` by hitting the API to quickly in a short period of time.
 - `HTTP 503 Rate Limit Exceeded` by hitting the API to quickly in a short period of time.
 - `HTTP 400 Bad Request` by requesting a resource that does not exist.
 
 These are just a couple of examples and you should read the official documentation to find out more about the possible errors.
 
-### Thrown exceptions
+### Rate Limit Exceptions
+
+Xero returns header values indicating the number of calls remaining before reaching their API lmits.
+https://developer.xero.com/documentation/guides/oauth2/limits/
+
+The Application is updated following every request and you can track the number of requests remaining using the Application::getAppRateLimits() method. It returns an array with the following keys and associated integer values.
+
+    'last-api-call' // The int timestamp of the last request made to the Xero API
+    'app-min-limit-remaining' // The number of requests remaining for the application as a whole in the current minute. The normal limit is 10,000.
+    'tenant-day-limit-remaining' // The number of requests remaining for the individual tenant by the day, limit is 5,000.
+    'tenant-min-limit-remaining' // The number of requests remaining for the individual tenant by the minute, limit is 60.
+
+These values can be used to decide if additional requests will throttled or sent to some message queue. For example:
+
+``` php
+    // If you know the number of API calls that you intend to make. 
+    $myExpectedApiCalls = 50;
+
+    // Before executing a statement, you could check the the rate limits.
+    $tenantDailyLimitRemaining = $xero->getTenantDayLimitRemining();
+
+    // If the expected number of API calls is higher than the number remaining for the tenant then do something.
+    if($myExpectedApiCalls > tenantDailyLimitRemaining){
+       // Send the calls to a queue for processing at another time
+       // Or throttle the calls to suit your needs.
+    }
+```
+
+If the Application exceeds the rate limits Xero will return an HTTP 429 Too Many Requests response. By default, this response is caught and thrown as a RateLimitException.
+
+You can provide a more graceful method of dealing with HTTP 429 responses by using the Guzzle RetryMiddleware. You need to replace the transport client created when instantiating the Application. For example:
+
+```php
+
+// use GuzzleHttp\Client;
+// use GuzzleHttp\HandlerStack;
+// use GuzzleHttp\Middleware;
+// use GuzzleHttp\RetryMiddleware;
+// use Psr\Http\Message\RequestInterface;
+// use Psr\Http\Message\ResponseInterface;
+
+public function yourApplicationCreationMethod($accessToken, $tenantId): Application {
+
+   // By default the contructor creates a Guzzle Client without any handlers. Pass a third argument 'false' to skip the general client constructor.
+   $xero = new Application($accessToken, $tenantId, false);
+
+   // Create a new handler stack
+   $stack = HandlerStack::create();
+
+   // Create the MiddleWare callable, in this case with a maximum limit of 5 retries.
+   $stack->push($this->getRetryMiddleware(5));
+
+   // Create a new Guzzle Client
+   $transport = new Client([
+       'headers' => [
+           'User-Agent' => sprintf(Application::USER_AGENT_STRING, Helpers::getPackageVersion()),
+           'Authorization' => sprintf('Bearer %s', $accessToken),
+           'Xero-tenant-id' => $tenantId,
+       ],
+       'handler' => $stack
+   ]);
+
+   // Replace the default Client from the application constructor with our new Client using the RetryMiddleware
+   $xero->setTransport($transport);
+
+   return $xero
+
+}
+
+/**
+ * Customise the RetryMiddeware to suit your needs. Perhaps creating log messages, or making decisions about when to retry or not.
+ */
+protected function getRetryMiddleware(int $maxRetries): callable
+{
+    $decider = function (
+        int $retries,
+        RequestInterface $request,
+        ResponseInterface $response = null
+    ) use (
+        $maxRetries
+    ): bool {
+        return
+            $retries < $maxRetries
+            && null !== $response
+            && \XeroPHP\Remote\Response::STATUS_TOO_MANY_REQUESTS === $response->getStatusCode();
+    };
+
+    $delay = function (int $retries, ResponseInterface $response): int {
+        if (!$response->hasHeader('Retry-After')) {
+            return RetryMiddleware::exponentialDelay($retries);
+        }
+
+        $retryAfter = $response->getHeaderLine('Retry-After');
+
+        if (!is_numeric($retryAfter)) {
+            $retryAfter = (new \DateTime($retryAfter))->getTimestamp() - time();
+        }
+
+        return (int)$retryAfter * 1000;
+    };
+
+    return Middleware::retry($decider, $delay);
+}
+
+```
+
+### Thrown Exceptions
 
 This library will parse the response Xero returns and throw an exception when it hits one of these errors. Below is a table showing the response code and corresponding exception that is thrown:
 
@@ -275,6 +416,7 @@ This library will parse the response Xero returns and throw an exception when it
 | 403 Forbidden | `\XeroPHP\Remote\Exception\ForbiddenException` |
 | 403 ReportPermissionMissingException | `\XeroPHP\Remote\Exception\ReportPermissionMissingException` |
 | 404 Not Found | `\XeroPHP\Remote\Exception\NotFoundException` |
+| 429 Too Many Requests | `\XeroPHP\Remote\Exception\RateLimitExceededException` |
 | 500 Internal Error | `\XeroPHP\Remote\Exception\InternalErrorException` |
 | 501 Not Implemented | `\XeroPHP\Remote\Exception\NotImplementedException` |
 | 503 Rate Limit Exceeded | `\XeroPHP\Remote\Exception\RateLimitExceededException` |
@@ -283,7 +425,7 @@ This library will parse the response Xero returns and throw an exception when it
 
 See: [Response codes and errors documentation](https://developer.xero.com/documentation/api/http-response-codes)
 
-### Handling exceptions
+### Handling Exceptions
 
 To catch and handle these exceptions you can wrap the request in a try / catch block and deal with each exception as needed.
 
